@@ -9,22 +9,96 @@ import (
 
 	"cloud.google.com/go/bigtable"
 	"google.golang.org/api/option"
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials/google"
 	"google.golang.org/grpc/status"
+
+	_ "google.golang.org/grpc/balancer/rls" // Register the RLS LB policy
 )
 
 var (
-	projectID       = flag.String("project_id", "directpath-prod-manual-testing", "GCP project to use")
-	instanceID      = flag.String("instance_id", "blackbox-us-central1-b", "Cloud Bigtable instance to use")
-	tableID         = flag.String("table_id", "easwars-test-table", "Cloud Bigtable table to use")
-	columnFamily    = flag.String("column_family", "cf1", "Cloud Bigtable column family to use")
-	columnQualifier = flag.String("column_qualifier", "greeting", "Cloud Bigtable column qualifier to use")
-	rowKeyPrefix    = flag.String("row_key_prefix", "row_key_", "Cloud Bigtable row key to use")
+	projectID           = flag.String("project_id", "directpath-prod-manual-testing", "GCP project to use")
+	instanceID          = flag.String("instance_id", "blackbox-us-central1-b", "Cloud Bigtable instance to use")
+	tableID             = flag.String("table_id", "easwars-test-table", "Cloud Bigtable table to use")
+	columnFamily        = flag.String("column_family", "cf1", "Cloud Bigtable column family to use")
+	columnQualifier     = flag.String("column_qualifier", "greeting", "Cloud Bigtable column qualifier to use")
+	rowKeyPrefix        = flag.String("row_key_prefix", "row_key_", "Cloud Bigtable row key to use")
+	appProfile          = flag.String("app_profile", "", "Cloud Bigtable application profile to use. If unspecified, the default app profile will be used")
+	enableDefaultTarget = flag.Bool("enable_default_target", false, "Whether to set a default target in the service config")
+	skipTableDeletion   = flag.Bool("skip_table_deletion", false, "Whether to skip table deletion at the end")
 )
 
 const (
-	cbtAdminTestEndpoint = "test-bigtableadmin.sandbox.googleapis.com:443"
-	cbtDataTestEndpoint  = "test-bigtable.sandbox.googleapis.com:443"
+	cbtAdminTestEndpoint = "dns:///test-bigtableadmin.sandbox.googleapis.com"
+	cbtDataTestEndpoint  = "dns:///test-bigtable.sandbox.googleapis.com"
+	cbtRLSTestEndpoint   = "dns:///test-bigtablerls.sandbox.googleapis.com"
+	rlsDefaultTarget     = "dns:///test-bigtable.sandbox.googleapis.com"
+
+	// Service config for the RLS LB policy.
+	//
+	// `lookupService` and `defaultTarget` are to be filled in with the value of
+	// the RLS server and the default target respectively.
+	//
+	// Also contains service config for the gRPC channel to the RLS server. This
+	// is required since the CBT RLS server implementation is only available via
+	// directpath.
+	serviceConfigTmpl = `
+{
+  "loadBalancingConfig": [
+    {
+      "rls_experimental": {
+        "routeLookupConfig": {
+          "grpcKeybuilders": [
+            {
+              "names": [
+                {
+                  "service": "google.bigtable.v2.Bigtable"
+                }
+              ],
+              "headers": [
+                {
+                  "key": "x-goog-request-params",
+                  "names": ["x-goog-request-params"]
+                },
+                {
+                  "key": "google-cloud-resource-prefix",
+                  "names": ["google-cloud-resource-prefix"]
+                }
+              ],
+              "extraKeys": {
+                "host": "server",
+                "service": "service",
+                "method": "method"
+              }
+            }
+          ],
+          "lookupService": "%s",
+          "lookupServiceTimeout" : "10s",
+          "maxAge": "300s",
+          "staleAge" : "240s",
+          "cacheSizeBytes": 1000,
+          "defaultTarget": "%s"
+        },
+        "routeLookupChannelServiceConfig": {
+          "loadBalancingConfig": [{"grpclb": {"childPolicy": [{"pick_first": {} }] }}]
+        },
+        "childPolicy": [
+          {
+            "grpclb": {
+              "childPolicy": [
+                {
+                  "pick_first": {}
+                }
+              ]
+            }
+          }
+        ],
+        "childPolicyConfigTargetFieldName": "serviceName"
+      }
+    }
+  ]
+}`
 )
 
 func main() {
@@ -38,9 +112,7 @@ func main() {
 	}
 	defer adminClient.Close()
 
-	// TODO: Create gRPC clientConn with RLS config, pointing to the CBT dataTestEndpoint, and pass it to bigtable.NewClient() with a WithGRPCConn() ClientOption.
-	// cc, err := grpc.Dial(cbtDataTestEndpoint, grpc.WithDisableServiceConfig(), grpc.WithDefaultServiceConfig())
-	dataClient, err := bigtable.NewClient(ctx, *projectID, *instanceID, option.WithEndpoint(cbtDataTestEndpoint))
+	dataClient, err := createDataClient(ctx, *projectID, *instanceID, cbtDataTestEndpoint, *appProfile, *enableDefaultTarget)
 	if err != nil {
 		log.Fatalf("Bigtable data client creation failed: %v", err)
 	}
@@ -71,11 +143,38 @@ func main() {
 		log.Fatalf("Reading entrire table using data client failed: %v", err)
 	}
 
+	if *skipTableDeletion {
+		return
+	}
+
 	log.Printf("Attempting to delete table %q...\n", *tableID)
 	if err := adminClient.DeleteTable(ctx, *tableID); err != nil {
 		log.Fatalf("Failed to delete table %q: %v", *tableID, err)
 	}
 	log.Printf("Table %q deleted\n", *tableID)
+}
+
+func createDataClient(ctx context.Context, project, instance, endpoint, appProfile string, enableDefaultTarget bool) (*bigtable.Client, error) {
+	defaultTarget := ""
+	if enableDefaultTarget {
+		defaultTarget = rlsDefaultTarget
+	}
+	serviceConfig := fmt.Sprintf(serviceConfigTmpl, cbtRLSTestEndpoint, defaultTarget)
+	cc, err := grpc.Dial(endpoint,
+		grpc.WithDisableServiceConfig(),
+		grpc.WithDefaultServiceConfig(serviceConfig),
+		grpc.WithCredentialsBundle(google.NewDefaultCredentials()),
+		grpc.WithDefaultCallOptions(grpc.MaxCallSendMsgSize(1<<28), grpc.MaxCallRecvMsgSize(1<<28)),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	opts := []option.ClientOption{option.WithGRPCConn(cc)}
+	if appProfile != "" {
+		return bigtable.NewClientWithConfig(ctx, project, instance, bigtable.ClientConfig{AppProfile: appProfile}, opts...)
+	}
+	return bigtable.NewClient(ctx, project, instance, opts...)
 }
 
 func createTable(ctx context.Context, adminClient *bigtable.AdminClient, tableID, columnFamily string) error {

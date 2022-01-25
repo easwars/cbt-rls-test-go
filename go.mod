@@ -19,6 +19,6 @@ require (
 	google.golang.org/api v0.59.0 // indirect
 	google.golang.org/appengine v1.6.7 // indirect
 	google.golang.org/genproto v0.0.0-20211027162914-98a5263abeca // indirect
-	google.golang.org/grpc v1.40.0 // indirect
+	google.golang.org/grpc v1.45.0-dev.0.20220125185310-449f1b222a55 // indirect
 	google.golang.org/protobuf v1.27.1 // indirect
 )
